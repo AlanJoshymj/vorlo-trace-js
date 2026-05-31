@@ -1,0 +1,139 @@
+/**
+ * Vorlo Async Sender — fire-and-forget HTTP sender for trace events.
+ *
+ * Node is single-threaded, so "fire-and-forget" means we kick off a fetch()
+ * without awaiting it and swallow every failure — the SDK must never affect
+ * the agent. We bound the number of in-flight requests so an unreachable
+ * server can never grow memory without limit.
+ */
+import type { ErrorDiagnosis, PreviousStep } from './errorTranslator.js';
+
+const SDK_VERSION = '0.1.0';
+const SEND_TIMEOUT_MS = 2000;
+const MAX_IN_FLIGHT = 10_000; // drop events rather than grow unbounded
+
+const DEBUG = ['1', 'true', 'yes'].includes((process.env.VORLO_DEBUG ?? '').toLowerCase());
+
+function debug(...args: unknown[]): void {
+  if (DEBUG) console.error('[vorlo]', ...args);
+}
+
+export interface TraceEvent {
+  event_type: string;
+  session_id?: string;
+  trace_id?: string;
+  span_id?: string;
+  parent_span_id?: string;
+  agent_name?: string;
+  api_key?: string;
+  step_number?: number;
+  tool_name?: string;
+  tool_type?: string;
+  input?: string;
+  output?: string;
+  error?: string;
+  error_diagnosis?: Omit<ErrorDiagnosis, never> | null;
+  reasoning?: string;
+  status?: string;
+  latency_ms?: number;
+  cost_tokens?: number;
+  previous_step_context?: PreviousStep[];
+  created_at?: string;
+  [key: string]: unknown;
+}
+
+interface TracePayload {
+  session_id: string;
+  agent_name: string;
+  api_key: string;
+  step: Record<string, unknown>;
+}
+
+export function toTracePayload(event: TraceEvent): TracePayload | null {
+  if (event.event_type !== 'step') return null;
+
+  let toolType = String(event.tool_type ?? 'sensor').toUpperCase();
+  if (toolType !== 'SENSOR' && toolType !== 'ACTUATOR') toolType = 'ACTUATOR';
+
+  const step: Record<string, unknown> = {
+    step_number: event.step_number ?? 1,
+    tool_name: event.tool_name ?? 'unknown',
+    tool_type: toolType,
+    input: event.input ?? '',
+    output: event.output ?? '',
+    error: event.error ?? '',
+    error_diagnosis: event.error_diagnosis ?? null,
+    reasoning: event.reasoning ?? '',
+    status: event.status ?? 'success',
+    latency_ms: event.latency_ms ?? 0,
+    cost_tokens: event.cost_tokens ?? 0,
+    previous_step_context: event.previous_step_context ?? [],
+    trace_id: event.trace_id ?? '',
+    span_id: event.span_id ?? '',
+    parent_span_id: event.parent_span_id ?? '',
+    created_at: event.created_at ?? new Date().toISOString(),
+  };
+
+  return {
+    session_id: event.session_id ?? '',
+    agent_name: event.agent_name ?? '',
+    api_key: event.api_key ?? '',
+    step,
+  };
+}
+
+export class AsyncSender {
+  private readonly endpoint: string;
+  private readonly apiKey: string;
+  private readonly headers: Record<string, string>;
+  private readonly inFlight = new Set<Promise<void>>();
+
+  constructor(serverUrl: string, apiKey: string) {
+    this.endpoint = `${serverUrl.replace(/\/+$/, '')}/v1/trace`;
+    this.apiKey = apiKey;
+    this.headers = {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${apiKey}`,
+      'User-Agent': `vorlo-trace-sdk-js/${SDK_VERSION}`,
+    };
+  }
+
+  /** Enqueue an event for async sending. Never blocks, never rejects. */
+  send(event: TraceEvent): void {
+    if (event.event_type !== 'step') return;
+    if (this.inFlight.size >= MAX_IN_FLIGHT) {
+      debug('In-flight cap reached — dropping event for session', event.session_id ?? '?');
+      return;
+    }
+
+    const payload = toTracePayload(event);
+    if (payload === null) return;
+
+    const promise = this.postEvent(payload).catch(() => {
+      // swallow — the SDK must never surface a network error to the agent
+    });
+    this.inFlight.add(promise);
+    void promise.finally(() => this.inFlight.delete(promise));
+  }
+
+  /** Wait for in-flight sends to drain. Used primarily in tests. */
+  async flush(): Promise<void> {
+    await Promise.allSettled([...this.inFlight]);
+  }
+
+  private async postEvent(payload: TracePayload): Promise<void> {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), SEND_TIMEOUT_MS);
+    try {
+      await fetch(this.endpoint, {
+        method: 'POST',
+        headers: this.headers,
+        body: JSON.stringify(payload),
+        signal: controller.signal,
+      });
+      debug('Sent step', payload.step.step_number, 'for session', payload.session_id);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+}
