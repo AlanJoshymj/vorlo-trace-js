@@ -330,6 +330,8 @@ export class VorloHandler extends BaseCallbackHandler {
         api_key: this.apiKey,
         status: 'success',
         latency_ms: this.session.duration_ms,
+        duration_ms: this.session.duration_ms,
+        total_steps: this.session.step_count,
         output: truncate(action.returnValues, MAX_OUTPUT_CHARS),
       };
       this.sender.send(event);
@@ -376,6 +378,8 @@ export class VorloHandler extends BaseCallbackHandler {
           api_key: this.apiKey,
           status: 'success',
           latency_ms: this.session.duration_ms,
+          duration_ms: this.session.duration_ms,
+          total_steps: this.session.step_count,
           output: truncate(outputs, MAX_OUTPUT_CHARS),
         };
         this.sender.send(event);
@@ -397,6 +401,8 @@ export class VorloHandler extends BaseCallbackHandler {
           api_key: this.apiKey,
           status: 'failed',
           latency_ms: this.session.duration_ms,
+          duration_ms: this.session.duration_ms,
+          total_steps: this.session.step_count,
           error: truncate(error instanceof Error ? error.message : error, MAX_OUTPUT_CHARS),
         };
         this.sender.send(event);

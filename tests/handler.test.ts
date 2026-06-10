@@ -4,13 +4,16 @@ import assert from 'node:assert/strict';
 import { VorloHandler } from '../src/handler.js';
 import type { Serialized } from '@langchain/core/load/serializable';
 
-// Capture outgoing /v1/trace payloads by stubbing global fetch.
+// Capture outgoing payloads (with their endpoint) by stubbing global fetch.
 const realFetch = globalThis.fetch;
 let captured: any[] = [];
+let capturedUrls: string[] = [];
 
 beforeEach(() => {
   captured = [];
-  globalThis.fetch = (async (_url: string, init?: { body?: string }) => {
+  capturedUrls = [];
+  globalThis.fetch = (async (url: string, init?: { body?: string }) => {
+    capturedUrls.push(String(url));
     if (init?.body) captured.push(JSON.parse(init.body));
     return new Response('{}', { status: 200 });
   }) as typeof fetch;
@@ -90,11 +93,16 @@ describe('VorloHandler', () => {
     assert.match(captured[0].step.reasoning, /call search_web/);
   });
 
-  it('does not send session lifecycle events to /v1/trace', async () => {
+  it('sends session lifecycle events to /v1/session, never /v1/trace', async () => {
     const h = new VorloHandler({ serverUrl: 'http://localhost:9', apiKey: 'k' });
     h.handleChainStart(tool('agent'), { input: 'x' }, 'root');
     h.handleChainEnd({ output: 'y' }, 'root');
     await h.flush();
-    assert.equal(captured.length, 0);
+
+    assert.equal(captured.length, 2);
+    assert.ok(capturedUrls.every((u) => u.endsWith('/v1/session')));
+    assert.equal(captured[0].event_type, 'session_start');
+    assert.equal(captured[1].event_type, 'session_complete');
+    assert.equal(captured[1].status, 'success');
   });
 });
