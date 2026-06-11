@@ -36,7 +36,38 @@ const MAX_REASONING_CHARS = 3000;
 // Hard cap so a stream of un-paired start events can never leak memory.
 const MAX_TRACKED_SPANS = 5000;
 
-const HTTP_STATUS_RE = /\b([1-5]\d{2})\b/;
+// A bare \b([1-5]\d{2})\b would treat ANY 3-digit number as an HTTP status
+// ("KeyError at line 403 of utils.py" → diagnosed as 403 Forbidden), and a
+// wrong diagnosis is worse than none. Only extract a code when it appears in
+// an HTTP-shaped context. Mirrors the Python SDK's _HTTP_STATUS_PATTERNS.
+const HTTP_STATUS_PATTERNS: RegExp[] = [
+  // "HTTP 403", "HTTP/1.1 403", "HTTPS 503", "http status: 403"
+  /\bhttps?(?:\/\d\.\d)?\s*(?:status)?\s*[:=]?\s*([1-5]\d{2})\b/i,
+  // "status code 403", "status: 403", "status_code=404", "StatusCode: 429"
+  /\bstatus(?:[ _-]?code)?\s*[:=]?\s*([1-5]\d{2})\b/i,
+  // "error code: 429", "code=503"
+  /\b(?:error\s+)?code\s*[:=]\s*([1-5]\d{2})\b/i,
+  // "returned 503", "responded with 502", "got a 404", "received 429"
+  /\b(?:returned|respond(?:ed)?\s+with|got(?:\s+a)?|received)\s+([1-5]\d{2})\b/i,
+  // "SomeError: 403", "ToolError(429)" — a code immediately after an error label
+  /\b\w*(?:error|exception)\w*\s*[:(]\s*([1-5]\d{2})\b/i,
+  // "rate limited: 429", "rate limit (429)"
+  /\brate[ -]?limit\w*\s*[:=(]?\s*([1-5]\d{2})\b/i,
+  // "403 Forbidden", "429 Too Many Requests" — a code paired with ITS OWN
+  // canonical reason phrase ("503 not found in table" must not match).
+  new RegExp(
+    '\\b(?:' +
+      '(400)\\s+bad request|(401)\\s+unauthorized|(402)\\s+payment required|' +
+      '(403)\\s+forbidden|(404)\\s+not found|(405)\\s+method not allowed|' +
+      '(406)\\s+not acceptable|(408)\\s+request timeout|(409)\\s+conflict|' +
+      '(410)\\s+gone|(412)\\s+precondition failed|(413)\\s+payload too large|' +
+      '(422)\\s+unprocessable|(429)\\s+too many requests|' +
+      '(500)\\s+internal server error|(501)\\s+not implemented|' +
+      '(502)\\s+bad gateway|(503)\\s+service unavailable|(504)\\s+gateway timeout' +
+      ')\\b',
+    'i',
+  ),
+];
 
 function classifyTool(toolName: string): string {
   const lower = toolName.toLowerCase();
@@ -63,11 +94,16 @@ function safeStr(value: unknown): string {
   }
 }
 
-function extractHttpStatus(message: string): number | null {
-  const match = HTTP_STATUS_RE.exec(message);
-  if (match) {
-    const code = Number(match[1]);
-    if (code >= 100 && code <= 599) return code;
+export function extractHttpStatus(message: string): number | null {
+  for (const pattern of HTTP_STATUS_PATTERNS) {
+    const match = pattern.exec(message);
+    if (match) {
+      // The paired code+reason pattern has many groups; take the one that hit.
+      const codeStr = match.slice(1).find((g) => g !== undefined);
+      if (codeStr === undefined) continue;
+      const code = Number(codeStr);
+      if (code >= 100 && code <= 599) return code;
+    }
   }
   return null;
 }

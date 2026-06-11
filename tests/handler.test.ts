@@ -1,7 +1,7 @@
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { VorloHandler } from '../src/handler.js';
+import { VorloHandler, extractHttpStatus } from '../src/handler.js';
 import type { Serialized } from '@langchain/core/load/serializable';
 
 // Capture outgoing payloads (with their endpoint) by stubbing global fetch.
@@ -104,5 +104,30 @@ describe('VorloHandler', () => {
     assert.equal(captured[0].event_type, 'session_start');
     assert.equal(captured[1].event_type, 'session_complete');
     assert.equal(captured[1].status, 'success');
+  });
+});
+
+describe('extractHttpStatus', () => {
+  it('extracts codes from HTTP-shaped contexts', () => {
+    assert.equal(extractHttpStatus('HTTP 403 Forbidden'), 403);
+    assert.equal(extractHttpStatus('Error: 500 Internal Server Error'), 500);
+    assert.equal(extractHttpStatus('Rate limited: 429'), 429);
+    assert.equal(extractHttpStatus('ToolError: 403 (charge_card)'), 403);
+    assert.equal(extractHttpStatus('Request req_8a2Xj returned 403'), 403);
+    assert.equal(extractHttpStatus('server responded with 502'), 502);
+    assert.equal(extractHttpStatus('status_code=404'), 404);
+    assert.equal(extractHttpStatus('got a 429 Too Many Requests'), 429);
+    assert.equal(extractHttpStatus('HTTP/1.1 503 Service Unavailable'), 503);
+  });
+
+  it('never treats bare numbers as status codes', () => {
+    // A wrong diagnosis is worse than none.
+    assert.equal(extractHttpStatus('Connection refused'), null);
+    assert.equal(extractHttpStatus("KeyError: 'name'"), null);
+    assert.equal(extractHttpStatus('KeyError at line 403 of utils.py'), null);
+    assert.equal(extractHttpStatus('Processed 404 items in batch'), null);
+    assert.equal(extractHttpStatus('customer id 503 not found in table'), null);
+    assert.equal(extractHttpStatus('retried after 500 ms'), null);
+    assert.equal(extractHttpStatus('port 443 connection reset'), null);
   });
 });
