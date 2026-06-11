@@ -45,6 +45,8 @@ export class VorloSession {
 
   private previousSteps: StepSummary[] = [];
   private currentReasoning: string | null = null;
+  private pendingTokens = 0;
+  total_tokens = 0;
 
   constructor(agentName = 'default') {
     this.session_id = uuidHex();
@@ -96,6 +98,21 @@ export class VorloSession {
     const reasoning = this.currentReasoning;
     this.currentReasoning = null;
     return reasoning;
+  }
+
+  /** Accumulate token usage from LLM calls since the last tool start. */
+  addTokens(count: number): void {
+    if (count > 0) {
+      this.pendingTokens += count;
+      this.total_tokens += count;
+    }
+  }
+
+  /** Return and reset the pending token count. Called once per tool call. */
+  consumeTokens(): number {
+    const tokens = this.pendingTokens;
+    this.pendingTokens = 0;
+    return tokens;
   }
 
   get duration_ms(): number {

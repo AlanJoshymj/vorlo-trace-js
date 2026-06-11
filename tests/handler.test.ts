@@ -1,7 +1,7 @@
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { VorloHandler, extractHttpStatus } from '../src/handler.js';
+import { VorloHandler, extractHttpStatus, extractTotalTokens } from '../src/handler.js';
 import type { Serialized } from '@langchain/core/load/serializable';
 
 // Capture outgoing payloads (with their endpoint) by stubbing global fetch.
@@ -104,6 +104,45 @@ describe('VorloHandler', () => {
     assert.equal(captured[0].event_type, 'session_start');
     assert.equal(captured[1].event_type, 'session_complete');
     assert.equal(captured[1].status, 'success');
+  });
+});
+
+describe('token usage capture', () => {
+  it('attaches LLM token usage to the next step, then resets', async () => {
+    const h = new VorloHandler({ serverUrl: 'http://localhost:9', apiKey: 'k' });
+    h.handleLLMStart(tool('gpt'), ['decide'], 'llm-1');
+    h.handleLLMEnd(
+      {
+        generations: [[{ text: 'call search_web' }]],
+        llmOutput: { tokenUsage: { promptTokens: 100, completionTokens: 23, totalTokens: 123 } },
+      } as any,
+      'llm-1',
+    );
+    h.handleToolStart(tool('search_web'), '{}', 'run-1');
+    h.handleToolEnd('done', 'run-1');
+    h.handleToolStart(tool('get_more'), '{}', 'run-2');
+    h.handleToolEnd('done', 'run-2');
+    await h.flush();
+
+    assert.equal(captured[0].step.cost_tokens, 123);
+    assert.equal(captured[1].step.cost_tokens, 0);
+  });
+
+  it('reads Anthropic-style usage and per-message usage_metadata', () => {
+    assert.equal(
+      extractTotalTokens({
+        generations: [],
+        llmOutput: { usage: { input_tokens: 40, output_tokens: 2 } },
+      } as any),
+      42,
+    );
+    assert.equal(
+      extractTotalTokens({
+        generations: [[{ text: 'x', message: { usage_metadata: { input_tokens: 10, output_tokens: 5 } } }]],
+      } as any),
+      15,
+    );
+    assert.equal(extractTotalTokens({ generations: [[{ text: 'x' }]] } as any), 0);
   });
 });
 

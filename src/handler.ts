@@ -128,6 +128,40 @@ interface ActiveStep {
   span_id: string;
   parent_span_id: string;
   reasoning: string;
+  cost_tokens: number;
+}
+
+/**
+ * Extract total token usage from an LLMResult, across provider shapes:
+ * OpenAI-style llmOutput.tokenUsage, Anthropic-style llmOutput.usage, and
+ * per-message usage_metadata (newer LangChain chat models).
+ * Returns 0 when usage is unavailable — never throws.
+ */
+export function extractTotalTokens(output: LLMResult): number {
+  try {
+    const llmOutput = (output?.llmOutput ?? {}) as Record<string, any>;
+    const usage = llmOutput.tokenUsage ?? llmOutput.token_usage ?? llmOutput.usage ?? {};
+    let total =
+      usage.totalTokens ??
+      usage.total_tokens ??
+      (usage.promptTokens ?? usage.prompt_tokens ?? usage.input_tokens ?? 0) +
+        (usage.completionTokens ?? usage.completion_tokens ?? usage.output_tokens ?? 0);
+    if (total > 0) return Number(total) || 0;
+
+    for (const genList of output?.generations ?? []) {
+      for (const gen of genList) {
+        const meta = (gen as unknown as { message?: { usage_metadata?: Record<string, number> } })
+          .message?.usage_metadata;
+        if (meta) {
+          total = meta.total_tokens ?? (meta.input_tokens ?? 0) + (meta.output_tokens ?? 0);
+          if (total > 0) return Number(total) || 0;
+        }
+      }
+    }
+  } catch {
+    /* usage extraction must never affect the agent */
+  }
+  return 0;
 }
 
 export interface VorloHandlerOptions {
@@ -226,6 +260,8 @@ export class VorloHandler extends BaseCallbackHandler {
         span_id: spanId,
         parent_span_id: parentSpanId,
         reasoning: reasoning ? truncate(reasoning, MAX_REASONING_CHARS) : '',
+        // Tokens spent by the LLM call(s) that decided this tool call
+        cost_tokens: this.session.consumeTokens(),
       });
     } catch {
       /* never affect the agent */
@@ -308,6 +344,7 @@ export class VorloHandler extends BaseCallbackHandler {
   override handleLLMEnd(output: LLMResult, runId: string): void {
     try {
       this.releaseSpan(runId);
+      this.session.addTokens(extractTotalTokens(output));
       const generations = output?.generations;
       if (generations && generations.length) {
         const firstGen = generations[0];
@@ -473,6 +510,7 @@ export class VorloHandler extends BaseCallbackHandler {
       output,
       status,
       latency_ms: latencyMs,
+      cost_tokens: stepData.cost_tokens,
       reasoning: stepData.reasoning,
       previous_step_context: this.session.getPreviousSteps(),
     };
