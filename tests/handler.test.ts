@@ -2,6 +2,7 @@ import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 
 import { VorloHandler, extractHttpStatus, extractTotalTokens } from '../src/handler.js';
+import { truncateKeepTail } from '../src/errorTranslator.js';
 import type { Serialized } from '@langchain/core/load/serializable';
 
 // Capture outgoing payloads (with their endpoint) by stubbing global fetch.
@@ -174,6 +175,53 @@ describe('token usage capture', () => {
       15,
     );
     assert.equal(extractTotalTokens({ generations: [[{ text: 'x' }]] } as any), 0);
+  });
+});
+
+describe('redaction hook', () => {
+  it('scrubs captured fields before they leave the process', async () => {
+    const h = new VorloHandler({
+      serverUrl: 'http://localhost:9',
+      apiKey: 'k',
+      redact: (text) => text.replaceAll('jane@x.com', '[EMAIL]'),
+    });
+    h.handleToolStart(tool('send_email'), 'to=jane@x.com subject=hi', 'run-1');
+    h.handleToolEnd('sent to jane@x.com', 'run-1');
+    await h.flush();
+
+    assert.ok(!captured[0].step.input.includes('jane@x.com'));
+    assert.ok(!captured[0].step.output.includes('jane@x.com'));
+    assert.match(captured[0].step.input, /\[EMAIL\]/);
+  });
+
+  it('drops content instead of leaking when the redact callback throws', async () => {
+    const h = new VorloHandler({
+      serverUrl: 'http://localhost:9',
+      apiKey: 'k',
+      redact: () => {
+        throw new Error('boom');
+      },
+    });
+    h.handleToolStart(tool('send_email'), 'ssn=123-45-6789', 'run-1');
+    h.handleToolEnd('ok', 'run-1');
+    await h.flush();
+
+    assert.ok(!captured[0].step.input.includes('123-45-6789'));
+    assert.match(captured[0].step.input, /redact callback raised/);
+  });
+});
+
+describe('truncateKeepTail', () => {
+  it('keeps the exception at the end of a long stack trace', () => {
+    const boilerplate = 'Traceback (most recent call last):\n' + '  at frame\n'.repeat(100);
+    const raw = boilerplate + "ValueError: schema mismatch on field 'customer_id'";
+    const out = truncateKeepTail(raw, 300);
+    assert.ok(out.length <= 300);
+    assert.match(out, /customer_id/);
+  });
+
+  it('returns short strings unchanged', () => {
+    assert.equal(truncateKeepTail('short', 100), 'short');
   });
 });
 

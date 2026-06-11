@@ -17,7 +17,7 @@ import type { BaseMessage } from '@langchain/core/messages';
 import type { AgentAction, AgentFinish } from '@langchain/core/agents';
 import type { ChainValues } from '@langchain/core/utils/types';
 
-import { translateError, type ErrorDiagnosis } from './errorTranslator.js';
+import { translateError, truncateKeepTail, type ErrorDiagnosis } from './errorTranslator.js';
 import { AsyncSender, type TraceEvent } from './sender.js';
 import { VorloSession } from './session.js';
 
@@ -168,6 +168,8 @@ export interface VorloHandlerOptions {
   serverUrl: string;
   apiKey: string;
   agentName?: string;
+  /** Scrub PII/secrets from captured strings before they leave the process. */
+  redact?: (text: string) => string;
 }
 
 export class VorloHandler extends BaseCallbackHandler {
@@ -178,6 +180,7 @@ export class VorloHandler extends BaseCallbackHandler {
   private readonly sender: AsyncSender;
   private readonly session: VorloSession;
   private readonly apiKey: string;
+  private readonly redact?: (text: string) => string;
 
   private readonly activeSteps = new Map<string, ActiveStep>();
   // OTel span registry — maps every runId (chain, llm, tool) to a span_id
@@ -189,6 +192,21 @@ export class VorloHandler extends BaseCallbackHandler {
     this.sender = new AsyncSender(opts.serverUrl, opts.apiKey);
     this.session = new VorloSession(opts.agentName ?? 'default');
     this.apiKey = opts.apiKey;
+    this.redact = opts.redact;
+  }
+
+  /**
+   * Apply the user's redact callback before anything leaves the process.
+   * If the callback throws we drop the content rather than ship it raw —
+   * the privacy-safe failure mode.
+   */
+  private scrub(text: string): string {
+    if (!this.redact || !text) return text;
+    try {
+      return String(this.redact(text));
+    } catch {
+      return '<redacted: redact callback raised>';
+    }
   }
 
   get sessionId(): string {
@@ -256,7 +274,7 @@ export class VorloHandler extends BaseCallbackHandler {
         step_number: stepNumber,
         tool_name: toolName,
         tool_type: toolType,
-        input: truncate(input, MAX_INPUT_CHARS),
+        input: truncate(this.scrub(input), MAX_INPUT_CHARS),
         start_time: Date.now(),
         span_id: spanId,
         parent_span_id: parentSpanId,
@@ -276,7 +294,7 @@ export class VorloHandler extends BaseCallbackHandler {
       if (stepData === undefined) return;
       this.activeSteps.delete(runId);
 
-      const outputStr = truncate(safeStr(output), MAX_OUTPUT_CHARS);
+      const outputStr = truncate(this.scrub(safeStr(output)), MAX_OUTPUT_CHARS);
       const latencyMs = Date.now() - stepData.start_time;
 
       const event = this.buildEvent(stepData, 'success', outputStr, latencyMs, '', null);
@@ -302,7 +320,8 @@ export class VorloHandler extends BaseCallbackHandler {
       this.activeSteps.delete(runId);
 
       const latencyMs = Date.now() - stepData.start_time;
-      const errorStr = error instanceof Error ? error.message : safeStr(error);
+      // Scrub BEFORE translating so PII never reaches the diagnosis text
+      const errorStr = this.scrub(error instanceof Error ? error.message : safeStr(error));
       const errorType = error instanceof Error ? error.name : typeof error;
       const httpStatus = extractHttpStatus(errorStr);
 
@@ -424,7 +443,7 @@ export class VorloHandler extends BaseCallbackHandler {
         latency_ms: this.session.duration_ms,
         duration_ms: this.session.duration_ms,
         total_steps: this.session.step_count,
-        output: truncate(action.returnValues, MAX_OUTPUT_CHARS),
+        output: truncate(this.scrub(safeStr(action.returnValues)), MAX_OUTPUT_CHARS),
       };
       this.sender.send(event);
     } catch {
@@ -449,7 +468,7 @@ export class VorloHandler extends BaseCallbackHandler {
           trace_id: this.session.trace_id,
           agent_name: this.session.agent_name,
           api_key: this.apiKey,
-          input: truncate(inputs, MAX_INPUT_CHARS),
+          input: truncate(this.scrub(safeStr(inputs)), MAX_INPUT_CHARS),
         };
         this.sender.send(event);
       }
@@ -472,7 +491,7 @@ export class VorloHandler extends BaseCallbackHandler {
           latency_ms: this.session.duration_ms,
           duration_ms: this.session.duration_ms,
           total_steps: this.session.step_count,
-          output: truncate(outputs, MAX_OUTPUT_CHARS),
+          output: truncate(this.scrub(safeStr(outputs)), MAX_OUTPUT_CHARS),
         };
         this.sender.send(event);
       }
@@ -495,7 +514,10 @@ export class VorloHandler extends BaseCallbackHandler {
           latency_ms: this.session.duration_ms,
           duration_ms: this.session.duration_ms,
           total_steps: this.session.step_count,
-          error: truncate(error instanceof Error ? error.message : error, MAX_OUTPUT_CHARS),
+          error: truncateKeepTail(
+            this.scrub(error instanceof Error ? error.message : safeStr(error)),
+            MAX_OUTPUT_CHARS,
+          ),
         };
         this.sender.send(event);
       }
@@ -530,7 +552,7 @@ export class VorloHandler extends BaseCallbackHandler {
       status,
       latency_ms: latencyMs,
       cost_tokens: stepData.cost_tokens,
-      reasoning: stepData.reasoning,
+      reasoning: this.scrub(stepData.reasoning),
       previous_step_context: this.session.getPreviousSteps(),
     };
 
