@@ -8,7 +8,7 @@
  */
 import type { ErrorDiagnosis, PreviousStep } from './errorTranslator.js';
 
-const SDK_VERSION = '0.1.0';
+const SDK_VERSION = '0.2.0';
 const SEND_TIMEOUT_MS = 2000;
 const MAX_IN_FLIGHT = 10_000; // drop events rather than grow unbounded
 
