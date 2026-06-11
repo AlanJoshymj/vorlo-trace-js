@@ -249,7 +249,8 @@ export class VorloHandler extends BaseCallbackHandler {
       const toolType = classifyTool(toolName);
       const spanId = this.registerSpan(runId);
       const parentSpanId = this.resolveParentSpan(parentRunId);
-      const reasoning = this.session.consumeReasoning();
+      const scope = parentRunId ?? '';
+      const reasoning = this.session.consumeReasoning(scope);
 
       this.activeSteps.set(runId, {
         step_number: stepNumber,
@@ -261,7 +262,7 @@ export class VorloHandler extends BaseCallbackHandler {
         parent_span_id: parentSpanId,
         reasoning: reasoning ? truncate(reasoning, MAX_REASONING_CHARS) : '',
         // Tokens spent by the LLM call(s) that decided this tool call
-        cost_tokens: this.session.consumeTokens(),
+        cost_tokens: this.session.consumeTokens(scope),
       });
     } catch {
       /* never affect the agent */
@@ -331,28 +332,35 @@ export class VorloHandler extends BaseCallbackHandler {
 
   // ── LLM callbacks ────────────────────────────────────────────────────
 
-  override handleLLMStart(_llm: Serialized, prompts: string[], runId: string): void {
+  override handleLLMStart(
+    _llm: Serialized,
+    prompts: string[],
+    runId: string,
+    parentRunId?: string,
+  ): void {
     try {
       this.registerSpan(runId);
+      // Scoped by parent run so parallel agents don't steal each other's reasoning.
       const combined = prompts && prompts.length ? prompts.join('\n') : '';
-      this.session.setReasoning(truncate(combined, MAX_REASONING_CHARS));
+      this.session.setReasoning(truncate(combined, MAX_REASONING_CHARS), parentRunId ?? '');
     } catch {
       /* swallow */
     }
   }
 
-  override handleLLMEnd(output: LLMResult, runId: string): void {
+  override handleLLMEnd(output: LLMResult, runId: string, parentRunId?: string): void {
     try {
       this.releaseSpan(runId);
-      this.session.addTokens(extractTotalTokens(output));
+      const scope = parentRunId ?? '';
+      this.session.addTokens(extractTotalTokens(output), scope);
       const generations = output?.generations;
       if (generations && generations.length) {
         const firstGen = generations[0];
         if (firstGen && firstGen.length) {
           const text = firstGen[0]?.text ?? '';
-          const current = this.session.consumeReasoning() ?? '';
+          const current = this.session.consumeReasoning(scope) ?? '';
           const combined = current ? `${current}\n---LLM OUTPUT---\n${text}` : text;
-          this.session.setReasoning(truncate(combined, MAX_REASONING_CHARS));
+          this.session.setReasoning(truncate(combined, MAX_REASONING_CHARS), scope);
         }
       }
     } catch {
@@ -360,7 +368,12 @@ export class VorloHandler extends BaseCallbackHandler {
     }
   }
 
-  override handleChatModelStart(_llm: Serialized, messages: BaseMessage[][], runId: string): void {
+  override handleChatModelStart(
+    _llm: Serialized,
+    messages: BaseMessage[][],
+    runId: string,
+    parentRunId?: string,
+  ): void {
     try {
       this.registerSpan(runId);
       const all: string[] = [];
@@ -369,7 +382,7 @@ export class VorloHandler extends BaseCallbackHandler {
           all.push(`[${messageType(msg)}] ${safeStr(msg.content)}`);
         }
       }
-      this.session.setReasoning(truncate(all.join('\n'), MAX_REASONING_CHARS));
+      this.session.setReasoning(truncate(all.join('\n'), MAX_REASONING_CHARS), parentRunId ?? '');
     } catch {
       /* swallow */
     }
@@ -377,17 +390,23 @@ export class VorloHandler extends BaseCallbackHandler {
 
   // ── Agent callbacks ──────────────────────────────────────────────────
 
-  override handleAgentAction(action: AgentAction, _runId: string): void {
+  override handleAgentAction(action: AgentAction, runId: string): void {
     try {
+      // Agent actions fire on the executor's chain run, and tools started by
+      // that executor get THIS runId as their parent — so the scope for the
+      // upcoming tool is runId. The LLM call that produced this decision
+      // stored its reasoning under the same scope (its parent is also the
+      // executor run).
+      const scope = runId ?? '';
       const parts: string[] = [];
-      const current = this.session.consumeReasoning();
+      const current = this.session.consumeReasoning(scope);
       if (current) parts.push(current);
       parts.push(
         `Agent decided to call tool '${action.tool}' with input: ` +
           `${truncate(action.toolInput, 500)}`,
       );
       if (action.log) parts.push(`Agent reasoning: ${truncate(action.log, 1000)}`);
-      this.session.setReasoning(truncate(parts.join('\n'), MAX_REASONING_CHARS));
+      this.session.setReasoning(truncate(parts.join('\n'), MAX_REASONING_CHARS), scope);
     } catch {
       /* swallow */
     }

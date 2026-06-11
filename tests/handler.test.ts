@@ -107,6 +107,37 @@ describe('VorloHandler', () => {
   });
 });
 
+describe('reasoning scoping under concurrency', () => {
+  it('parallel agents do not swap reasoning', async () => {
+    const h = new VorloHandler({ serverUrl: 'http://localhost:9', apiKey: 'k' });
+    h.handleLLMStart(tool('gpt'), ['plan for agent A'], 'llm-a', 'parent-a');
+    h.handleLLMStart(tool('gpt'), ['plan for agent B'], 'llm-b', 'parent-b');
+
+    // Agent B's tool starts FIRST — under the old single-slot model it would
+    // have stolen whichever reasoning was written last.
+    h.handleToolStart(tool('tool_b'), '{}', 'run-b', 'parent-b');
+    h.handleToolEnd('ok', 'run-b');
+    h.handleToolStart(tool('tool_a'), '{}', 'run-a', 'parent-a');
+    h.handleToolEnd('ok', 'run-a');
+    await h.flush();
+
+    const stepB = captured.find((c) => c.step?.tool_name === 'tool_b');
+    const stepA = captured.find((c) => c.step?.tool_name === 'tool_a');
+    assert.match(stepB.step.reasoning, /agent B/);
+    assert.match(stepA.step.reasoning, /agent A/);
+  });
+
+  it('a sole pending entry still attaches when parents mismatch', async () => {
+    const h = new VorloHandler({ serverUrl: 'http://localhost:9', apiKey: 'k' });
+    h.handleLLMStart(tool('gpt'), ['the only plan'], 'llm-1', 'inner-chain');
+    h.handleToolStart(tool('tool_x'), '{}', 'run-1', 'different-parent');
+    h.handleToolEnd('ok', 'run-1');
+    await h.flush();
+
+    assert.match(captured[0].step.reasoning, /the only plan/);
+  });
+});
+
 describe('token usage capture', () => {
   it('attaches LLM token usage to the next step, then resets', async () => {
     const h = new VorloHandler({ serverUrl: 'http://localhost:9', apiKey: 'k' });
