@@ -43,6 +43,18 @@ function truncate(text: string, maxLength: number): string {
   return text.slice(0, maxLength - 3) + '...';
 }
 
+/**
+ * Truncate keeping both head and tail. Stack traces put the actual exception
+ * at the END, so head-only truncation would show boilerplate frames and cut
+ * the error itself. Mirrors the Python SDK's truncate_keep_tail.
+ */
+export function truncateKeepTail(text: string, maxLength: number): string {
+  if (text.length <= maxLength) return text;
+  const head = Math.floor(maxLength / 3);
+  const tail = maxLength - head - 5;
+  return `${text.slice(0, head)} ... ${text.slice(-tail)}`;
+}
+
 // ---------------------------------------------------------------------------
 // Helper functions for building context-aware root causes
 // ---------------------------------------------------------------------------
@@ -456,11 +468,11 @@ function genericDiagnosis(ctx: TranslateContext): ErrorDiagnosis {
     title: `Tool '${ctx.tool_name}' failed${statusPart}`,
     plain_english:
       `The tool '${ctx.tool_name}' encountered an error: ` +
-      `${truncate(ctx.raw_message, 200)}. ` +
+      `${truncateKeepTail(ctx.raw_message, 200)}. ` +
       'Vorlo could not match this to a known error pattern.',
     root_cause:
       `Error type: ${ctx.error_type}. ` +
-      `Raw message: ${truncate(ctx.raw_message, 300)}. ` +
+      `Raw message: ${truncateKeepTail(ctx.raw_message, 300)}. ` +
       'This error does not match any known pattern in the Vorlo error catalog. ' +
       'If you see this frequently, report it so we can add a specific diagnosis.',
     fix_hint:

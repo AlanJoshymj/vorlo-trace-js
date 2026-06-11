@@ -49,6 +49,47 @@ interface TracePayload {
   step: Record<string, unknown>;
 }
 
+const SESSION_EVENT_TYPES = new Set(['session_start', 'session_complete', 'session_error']);
+
+export interface SessionPayload {
+  session_id: string;
+  api_key: string;
+  event_type: string;
+  agent_name: string;
+  trace_id: string;
+  input: string;
+  output: string;
+  error: string;
+  total_steps: number;
+  duration_ms: number;
+  created_at: string;
+  status?: string;
+}
+
+/** Convert SDK lifecycle event shape into the server's /v1/session contract. */
+export function toSessionPayload(event: TraceEvent): SessionPayload | null {
+  if (!SESSION_EVENT_TYPES.has(event.event_type)) return null;
+
+  const payload: SessionPayload = {
+    session_id: event.session_id ?? '',
+    api_key: event.api_key ?? '',
+    event_type: event.event_type,
+    agent_name: event.agent_name ?? '',
+    trace_id: event.trace_id ?? '',
+    input: String(event.input ?? ''),
+    output: String(event.output ?? ''),
+    error: String(event.error ?? ''),
+    total_steps: Number(event.total_steps ?? 0) || 0,
+    // Older handler shapes reported wall duration as latency_ms
+    duration_ms: Number(event.duration_ms ?? event.latency_ms ?? 0) || 0,
+    created_at: event.created_at ?? new Date().toISOString(),
+  };
+  if (event.status === 'running' || event.status === 'success' || event.status === 'failed') {
+    payload.status = event.status;
+  }
+  return payload;
+}
+
 export function toTracePayload(event: TraceEvent): TracePayload | null {
   if (event.event_type !== 'step') return null;
 
@@ -83,13 +124,16 @@ export function toTracePayload(event: TraceEvent): TracePayload | null {
 }
 
 export class AsyncSender {
-  private readonly endpoint: string;
+  private readonly traceEndpoint: string;
+  private readonly sessionEndpoint: string;
   private readonly apiKey: string;
   private readonly headers: Record<string, string>;
   private readonly inFlight = new Set<Promise<void>>();
 
   constructor(serverUrl: string, apiKey: string) {
-    this.endpoint = `${serverUrl.replace(/\/+$/, '')}/v1/trace`;
+    const base = serverUrl.replace(/\/+$/, '');
+    this.traceEndpoint = `${base}/v1/trace`;
+    this.sessionEndpoint = `${base}/v1/session`;
     this.apiKey = apiKey;
     this.headers = {
       'Content-Type': 'application/json',
@@ -100,16 +144,24 @@ export class AsyncSender {
 
   /** Enqueue an event for async sending. Never blocks, never rejects. */
   send(event: TraceEvent): void {
-    if (event.event_type !== 'step') return;
     if (this.inFlight.size >= MAX_IN_FLIGHT) {
       debug('In-flight cap reached — dropping event for session', event.session_id ?? '?');
       return;
     }
 
-    const payload = toTracePayload(event);
+    // Steps go to /v1/trace, lifecycle events to /v1/session; anything else is dropped.
+    let endpoint: string;
+    let payload: TracePayload | SessionPayload | null;
+    if (event.event_type === 'step') {
+      endpoint = this.traceEndpoint;
+      payload = toTracePayload(event);
+    } else {
+      endpoint = this.sessionEndpoint;
+      payload = toSessionPayload(event);
+    }
     if (payload === null) return;
 
-    const promise = this.postEvent(payload).catch(() => {
+    const promise = this.postEvent(endpoint, payload).catch(() => {
       // swallow — the SDK must never surface a network error to the agent
     });
     this.inFlight.add(promise);
@@ -121,17 +173,20 @@ export class AsyncSender {
     await Promise.allSettled([...this.inFlight]);
   }
 
-  private async postEvent(payload: TracePayload): Promise<void> {
+  private async postEvent(
+    endpoint: string,
+    payload: TracePayload | SessionPayload,
+  ): Promise<void> {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), SEND_TIMEOUT_MS);
     try {
-      await fetch(this.endpoint, {
+      await fetch(endpoint, {
         method: 'POST',
         headers: this.headers,
         body: JSON.stringify(payload),
         signal: controller.signal,
       });
-      debug('Sent step', payload.step.step_number, 'for session', payload.session_id);
+      debug('Sent', 'step' in payload ? 'step' : payload.event_type, 'for session', payload.session_id);
     } finally {
       clearTimeout(timer);
     }

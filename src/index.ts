@@ -33,6 +33,12 @@ export interface InitOptions {
   serverUrl?: string;
   /** A name for this agent (shown in the dashboard). */
   agentName?: string;
+  /**
+   * Optional callback applied to every captured string (tool inputs/outputs,
+   * errors, reasoning) BEFORE it leaves the process — use it to scrub PII or
+   * secrets. If it throws, the content is dropped rather than shipped raw.
+   */
+  redact?: (text: string) => string;
 }
 
 export function init(options: InitOptions = {}): VorloHandler {
@@ -51,6 +57,7 @@ export function init(options: InitOptions = {}): VorloHandler {
     serverUrl: resolvedUrl,
     apiKey: resolvedKey,
     agentName: options.agentName ?? 'default',
+    redact: options.redact,
   });
   return handlerSingleton;
 }

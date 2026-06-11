@@ -17,7 +17,7 @@ import type { BaseMessage } from '@langchain/core/messages';
 import type { AgentAction, AgentFinish } from '@langchain/core/agents';
 import type { ChainValues } from '@langchain/core/utils/types';
 
-import { translateError, type ErrorDiagnosis } from './errorTranslator.js';
+import { translateError, truncateKeepTail, type ErrorDiagnosis } from './errorTranslator.js';
 import { AsyncSender, type TraceEvent } from './sender.js';
 import { VorloSession } from './session.js';
 
@@ -36,7 +36,38 @@ const MAX_REASONING_CHARS = 3000;
 // Hard cap so a stream of un-paired start events can never leak memory.
 const MAX_TRACKED_SPANS = 5000;
 
-const HTTP_STATUS_RE = /\b([1-5]\d{2})\b/;
+// A bare \b([1-5]\d{2})\b would treat ANY 3-digit number as an HTTP status
+// ("KeyError at line 403 of utils.py" → diagnosed as 403 Forbidden), and a
+// wrong diagnosis is worse than none. Only extract a code when it appears in
+// an HTTP-shaped context. Mirrors the Python SDK's _HTTP_STATUS_PATTERNS.
+const HTTP_STATUS_PATTERNS: RegExp[] = [
+  // "HTTP 403", "HTTP/1.1 403", "HTTPS 503", "http status: 403"
+  /\bhttps?(?:\/\d\.\d)?\s*(?:status)?\s*[:=]?\s*([1-5]\d{2})\b/i,
+  // "status code 403", "status: 403", "status_code=404", "StatusCode: 429"
+  /\bstatus(?:[ _-]?code)?\s*[:=]?\s*([1-5]\d{2})\b/i,
+  // "error code: 429", "code=503"
+  /\b(?:error\s+)?code\s*[:=]\s*([1-5]\d{2})\b/i,
+  // "returned 503", "responded with 502", "got a 404", "received 429"
+  /\b(?:returned|respond(?:ed)?\s+with|got(?:\s+a)?|received)\s+([1-5]\d{2})\b/i,
+  // "SomeError: 403", "ToolError(429)" — a code immediately after an error label
+  /\b\w*(?:error|exception)\w*\s*[:(]\s*([1-5]\d{2})\b/i,
+  // "rate limited: 429", "rate limit (429)"
+  /\brate[ -]?limit\w*\s*[:=(]?\s*([1-5]\d{2})\b/i,
+  // "403 Forbidden", "429 Too Many Requests" — a code paired with ITS OWN
+  // canonical reason phrase ("503 not found in table" must not match).
+  new RegExp(
+    '\\b(?:' +
+      '(400)\\s+bad request|(401)\\s+unauthorized|(402)\\s+payment required|' +
+      '(403)\\s+forbidden|(404)\\s+not found|(405)\\s+method not allowed|' +
+      '(406)\\s+not acceptable|(408)\\s+request timeout|(409)\\s+conflict|' +
+      '(410)\\s+gone|(412)\\s+precondition failed|(413)\\s+payload too large|' +
+      '(422)\\s+unprocessable|(429)\\s+too many requests|' +
+      '(500)\\s+internal server error|(501)\\s+not implemented|' +
+      '(502)\\s+bad gateway|(503)\\s+service unavailable|(504)\\s+gateway timeout' +
+      ')\\b',
+    'i',
+  ),
+];
 
 function classifyTool(toolName: string): string {
   const lower = toolName.toLowerCase();
@@ -63,11 +94,16 @@ function safeStr(value: unknown): string {
   }
 }
 
-function extractHttpStatus(message: string): number | null {
-  const match = HTTP_STATUS_RE.exec(message);
-  if (match) {
-    const code = Number(match[1]);
-    if (code >= 100 && code <= 599) return code;
+export function extractHttpStatus(message: string): number | null {
+  for (const pattern of HTTP_STATUS_PATTERNS) {
+    const match = pattern.exec(message);
+    if (match) {
+      // The paired code+reason pattern has many groups; take the one that hit.
+      const codeStr = match.slice(1).find((g) => g !== undefined);
+      if (codeStr === undefined) continue;
+      const code = Number(codeStr);
+      if (code >= 100 && code <= 599) return code;
+    }
   }
   return null;
 }
@@ -92,12 +128,48 @@ interface ActiveStep {
   span_id: string;
   parent_span_id: string;
   reasoning: string;
+  cost_tokens: number;
+}
+
+/**
+ * Extract total token usage from an LLMResult, across provider shapes:
+ * OpenAI-style llmOutput.tokenUsage, Anthropic-style llmOutput.usage, and
+ * per-message usage_metadata (newer LangChain chat models).
+ * Returns 0 when usage is unavailable — never throws.
+ */
+export function extractTotalTokens(output: LLMResult): number {
+  try {
+    const llmOutput = (output?.llmOutput ?? {}) as Record<string, any>;
+    const usage = llmOutput.tokenUsage ?? llmOutput.token_usage ?? llmOutput.usage ?? {};
+    let total =
+      usage.totalTokens ??
+      usage.total_tokens ??
+      (usage.promptTokens ?? usage.prompt_tokens ?? usage.input_tokens ?? 0) +
+        (usage.completionTokens ?? usage.completion_tokens ?? usage.output_tokens ?? 0);
+    if (total > 0) return Number(total) || 0;
+
+    for (const genList of output?.generations ?? []) {
+      for (const gen of genList) {
+        const meta = (gen as unknown as { message?: { usage_metadata?: Record<string, number> } })
+          .message?.usage_metadata;
+        if (meta) {
+          total = meta.total_tokens ?? (meta.input_tokens ?? 0) + (meta.output_tokens ?? 0);
+          if (total > 0) return Number(total) || 0;
+        }
+      }
+    }
+  } catch {
+    /* usage extraction must never affect the agent */
+  }
+  return 0;
 }
 
 export interface VorloHandlerOptions {
   serverUrl: string;
   apiKey: string;
   agentName?: string;
+  /** Scrub PII/secrets from captured strings before they leave the process. */
+  redact?: (text: string) => string;
 }
 
 export class VorloHandler extends BaseCallbackHandler {
@@ -108,6 +180,7 @@ export class VorloHandler extends BaseCallbackHandler {
   private readonly sender: AsyncSender;
   private readonly session: VorloSession;
   private readonly apiKey: string;
+  private readonly redact?: (text: string) => string;
 
   private readonly activeSteps = new Map<string, ActiveStep>();
   // OTel span registry — maps every runId (chain, llm, tool) to a span_id
@@ -119,6 +192,21 @@ export class VorloHandler extends BaseCallbackHandler {
     this.sender = new AsyncSender(opts.serverUrl, opts.apiKey);
     this.session = new VorloSession(opts.agentName ?? 'default');
     this.apiKey = opts.apiKey;
+    this.redact = opts.redact;
+  }
+
+  /**
+   * Apply the user's redact callback before anything leaves the process.
+   * If the callback throws we drop the content rather than ship it raw —
+   * the privacy-safe failure mode.
+   */
+  private scrub(text: string): string {
+    if (!this.redact || !text) return text;
+    try {
+      return String(this.redact(text));
+    } catch {
+      return '<redacted: redact callback raised>';
+    }
   }
 
   get sessionId(): string {
@@ -179,17 +267,20 @@ export class VorloHandler extends BaseCallbackHandler {
       const toolType = classifyTool(toolName);
       const spanId = this.registerSpan(runId);
       const parentSpanId = this.resolveParentSpan(parentRunId);
-      const reasoning = this.session.consumeReasoning();
+      const scope = parentRunId ?? '';
+      const reasoning = this.session.consumeReasoning(scope);
 
       this.activeSteps.set(runId, {
         step_number: stepNumber,
         tool_name: toolName,
         tool_type: toolType,
-        input: truncate(input, MAX_INPUT_CHARS),
+        input: truncate(this.scrub(input), MAX_INPUT_CHARS),
         start_time: Date.now(),
         span_id: spanId,
         parent_span_id: parentSpanId,
         reasoning: reasoning ? truncate(reasoning, MAX_REASONING_CHARS) : '',
+        // Tokens spent by the LLM call(s) that decided this tool call
+        cost_tokens: this.session.consumeTokens(scope),
       });
     } catch {
       /* never affect the agent */
@@ -203,7 +294,7 @@ export class VorloHandler extends BaseCallbackHandler {
       if (stepData === undefined) return;
       this.activeSteps.delete(runId);
 
-      const outputStr = truncate(safeStr(output), MAX_OUTPUT_CHARS);
+      const outputStr = truncate(this.scrub(safeStr(output)), MAX_OUTPUT_CHARS);
       const latencyMs = Date.now() - stepData.start_time;
 
       const event = this.buildEvent(stepData, 'success', outputStr, latencyMs, '', null);
@@ -229,7 +320,8 @@ export class VorloHandler extends BaseCallbackHandler {
       this.activeSteps.delete(runId);
 
       const latencyMs = Date.now() - stepData.start_time;
-      const errorStr = error instanceof Error ? error.message : safeStr(error);
+      // Scrub BEFORE translating so PII never reaches the diagnosis text
+      const errorStr = this.scrub(error instanceof Error ? error.message : safeStr(error));
       const errorType = error instanceof Error ? error.name : typeof error;
       const httpStatus = extractHttpStatus(errorStr);
 
@@ -259,27 +351,35 @@ export class VorloHandler extends BaseCallbackHandler {
 
   // ── LLM callbacks ────────────────────────────────────────────────────
 
-  override handleLLMStart(_llm: Serialized, prompts: string[], runId: string): void {
+  override handleLLMStart(
+    _llm: Serialized,
+    prompts: string[],
+    runId: string,
+    parentRunId?: string,
+  ): void {
     try {
       this.registerSpan(runId);
+      // Scoped by parent run so parallel agents don't steal each other's reasoning.
       const combined = prompts && prompts.length ? prompts.join('\n') : '';
-      this.session.setReasoning(truncate(combined, MAX_REASONING_CHARS));
+      this.session.setReasoning(truncate(combined, MAX_REASONING_CHARS), parentRunId ?? '');
     } catch {
       /* swallow */
     }
   }
 
-  override handleLLMEnd(output: LLMResult, runId: string): void {
+  override handleLLMEnd(output: LLMResult, runId: string, parentRunId?: string): void {
     try {
       this.releaseSpan(runId);
+      const scope = parentRunId ?? '';
+      this.session.addTokens(extractTotalTokens(output), scope);
       const generations = output?.generations;
       if (generations && generations.length) {
         const firstGen = generations[0];
         if (firstGen && firstGen.length) {
           const text = firstGen[0]?.text ?? '';
-          const current = this.session.consumeReasoning() ?? '';
+          const current = this.session.consumeReasoning(scope) ?? '';
           const combined = current ? `${current}\n---LLM OUTPUT---\n${text}` : text;
-          this.session.setReasoning(truncate(combined, MAX_REASONING_CHARS));
+          this.session.setReasoning(truncate(combined, MAX_REASONING_CHARS), scope);
         }
       }
     } catch {
@@ -287,7 +387,12 @@ export class VorloHandler extends BaseCallbackHandler {
     }
   }
 
-  override handleChatModelStart(_llm: Serialized, messages: BaseMessage[][], runId: string): void {
+  override handleChatModelStart(
+    _llm: Serialized,
+    messages: BaseMessage[][],
+    runId: string,
+    parentRunId?: string,
+  ): void {
     try {
       this.registerSpan(runId);
       const all: string[] = [];
@@ -296,7 +401,7 @@ export class VorloHandler extends BaseCallbackHandler {
           all.push(`[${messageType(msg)}] ${safeStr(msg.content)}`);
         }
       }
-      this.session.setReasoning(truncate(all.join('\n'), MAX_REASONING_CHARS));
+      this.session.setReasoning(truncate(all.join('\n'), MAX_REASONING_CHARS), parentRunId ?? '');
     } catch {
       /* swallow */
     }
@@ -304,17 +409,23 @@ export class VorloHandler extends BaseCallbackHandler {
 
   // ── Agent callbacks ──────────────────────────────────────────────────
 
-  override handleAgentAction(action: AgentAction, _runId: string): void {
+  override handleAgentAction(action: AgentAction, runId: string): void {
     try {
+      // Agent actions fire on the executor's chain run, and tools started by
+      // that executor get THIS runId as their parent — so the scope for the
+      // upcoming tool is runId. The LLM call that produced this decision
+      // stored its reasoning under the same scope (its parent is also the
+      // executor run).
+      const scope = runId ?? '';
       const parts: string[] = [];
-      const current = this.session.consumeReasoning();
+      const current = this.session.consumeReasoning(scope);
       if (current) parts.push(current);
       parts.push(
         `Agent decided to call tool '${action.tool}' with input: ` +
           `${truncate(action.toolInput, 500)}`,
       );
       if (action.log) parts.push(`Agent reasoning: ${truncate(action.log, 1000)}`);
-      this.session.setReasoning(truncate(parts.join('\n'), MAX_REASONING_CHARS));
+      this.session.setReasoning(truncate(parts.join('\n'), MAX_REASONING_CHARS), scope);
     } catch {
       /* swallow */
     }
@@ -330,7 +441,9 @@ export class VorloHandler extends BaseCallbackHandler {
         api_key: this.apiKey,
         status: 'success',
         latency_ms: this.session.duration_ms,
-        output: truncate(action.returnValues, MAX_OUTPUT_CHARS),
+        duration_ms: this.session.duration_ms,
+        total_steps: this.session.step_count,
+        output: truncate(this.scrub(safeStr(action.returnValues)), MAX_OUTPUT_CHARS),
       };
       this.sender.send(event);
     } catch {
@@ -355,7 +468,7 @@ export class VorloHandler extends BaseCallbackHandler {
           trace_id: this.session.trace_id,
           agent_name: this.session.agent_name,
           api_key: this.apiKey,
-          input: truncate(inputs, MAX_INPUT_CHARS),
+          input: truncate(this.scrub(safeStr(inputs)), MAX_INPUT_CHARS),
         };
         this.sender.send(event);
       }
@@ -376,7 +489,9 @@ export class VorloHandler extends BaseCallbackHandler {
           api_key: this.apiKey,
           status: 'success',
           latency_ms: this.session.duration_ms,
-          output: truncate(outputs, MAX_OUTPUT_CHARS),
+          duration_ms: this.session.duration_ms,
+          total_steps: this.session.step_count,
+          output: truncate(this.scrub(safeStr(outputs)), MAX_OUTPUT_CHARS),
         };
         this.sender.send(event);
       }
@@ -397,7 +512,12 @@ export class VorloHandler extends BaseCallbackHandler {
           api_key: this.apiKey,
           status: 'failed',
           latency_ms: this.session.duration_ms,
-          error: truncate(error instanceof Error ? error.message : error, MAX_OUTPUT_CHARS),
+          duration_ms: this.session.duration_ms,
+          total_steps: this.session.step_count,
+          error: truncateKeepTail(
+            this.scrub(error instanceof Error ? error.message : safeStr(error)),
+            MAX_OUTPUT_CHARS,
+          ),
         };
         this.sender.send(event);
       }
@@ -431,7 +551,8 @@ export class VorloHandler extends BaseCallbackHandler {
       output,
       status,
       latency_ms: latencyMs,
-      reasoning: stepData.reasoning,
+      cost_tokens: stepData.cost_tokens,
+      reasoning: this.scrub(stepData.reasoning),
       previous_step_context: this.session.getPreviousSteps(),
     };
 

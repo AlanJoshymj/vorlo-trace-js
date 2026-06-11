@@ -44,7 +44,16 @@ export class VorloSession {
   step_count = 0;
 
   private previousSteps: StepSummary[] = [];
-  private currentReasoning: string | null = null;
+  // Pending reasoning / token usage keyed by scope (the parent run id).
+  // The LLM call that decides a tool call and the tool call itself share a
+  // parent run, so scoping prevents parallel tool calls from stealing each
+  // other's reasoning. '' is the global scope for flat runs.
+  private reasoningByScope = new Map<string, string>();
+  private tokensByScope = new Map<string, number>();
+  total_tokens = 0;
+
+  // Hard cap so chains that never call tools cannot leak pending state.
+  private static readonly MAX_PENDING_SCOPES = 200;
 
   constructor(agentName = 'default') {
     this.session_id = uuidHex();
@@ -87,15 +96,58 @@ export class VorloSession {
     return this.previousSteps.map(summaryToDict);
   }
 
-  setReasoning(reasoning: string): void {
-    this.currentReasoning = reasoning;
+  setReasoning(reasoning: string, scope = ''): void {
+    if (this.reasoningByScope.size >= VorloSession.MAX_PENDING_SCOPES) {
+      this.reasoningByScope.clear();
+    }
+    this.reasoningByScope.set(scope, reasoning);
   }
 
-  /** Return and clear the stored reasoning. Called once per tool call. */
-  consumeReasoning(): string | null {
-    const reasoning = this.currentReasoning;
-    this.currentReasoning = null;
+  /**
+   * Return and clear the stored reasoning for a scope. Falls back to the
+   * global scope, then to a sole pending entry — nested runnable chains can
+   * put the LLM under a different parent than the tool, and with only one
+   * agent running that single entry is unambiguous.
+   */
+  consumeReasoning(scope = ''): string | null {
+    let reasoning = this.takeFrom(this.reasoningByScope, scope);
+    if (reasoning === null && scope !== '') reasoning = this.takeFrom(this.reasoningByScope, '');
+    if (reasoning === null && this.reasoningByScope.size === 1) {
+      const [k, v] = this.reasoningByScope.entries().next().value as [string, string];
+      this.reasoningByScope.delete(k);
+      reasoning = v;
+    }
     return reasoning;
+  }
+
+  /** Accumulate token usage from LLM calls since the last tool start. */
+  addTokens(count: number, scope = ''): void {
+    if (count > 0) {
+      if (this.tokensByScope.size >= VorloSession.MAX_PENDING_SCOPES) {
+        this.tokensByScope.clear();
+      }
+      this.tokensByScope.set(scope, (this.tokensByScope.get(scope) ?? 0) + count);
+      this.total_tokens += count;
+    }
+  }
+
+  /** Return and reset the pending token count for a scope (same fallbacks as reasoning). */
+  consumeTokens(scope = ''): number {
+    let tokens = this.takeFrom(this.tokensByScope, scope) ?? 0;
+    if (tokens === 0 && scope !== '') tokens = this.takeFrom(this.tokensByScope, '') ?? 0;
+    if (tokens === 0 && this.tokensByScope.size === 1) {
+      const [k, v] = this.tokensByScope.entries().next().value as [string, number];
+      this.tokensByScope.delete(k);
+      tokens = v;
+    }
+    return tokens;
+  }
+
+  private takeFrom<T>(map: Map<string, T>, key: string): T | null {
+    if (!map.has(key)) return null;
+    const value = map.get(key) as T;
+    map.delete(key);
+    return value;
   }
 
   get duration_ms(): number {
