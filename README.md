@@ -76,6 +76,18 @@ vorlo.init({ apiKey: 'vrlo_...' });
 const out = await vorlo.trace(agentExecutor, { input: 'Check my latest emails' });
 ```
 
+## MCP server — debug from inside your editor
+
+The package ships a zero-dependency MCP server, so Claude Code / Cursor / any
+MCP client can ask Vorlo *"why did my last run fail?"* without leaving the editor:
+
+```bash
+claude mcp add vorlo --env VORLO_API_KEY=vrlo_... -- npx -y -p vorlo-trace vorlo-mcp
+```
+
+Tools: `why_did_my_last_run_fail`, `get_session_diagnosis`,
+`list_recent_sessions`, `get_failure_clusters`.
+
 ## Configuration
 
 ```ts
